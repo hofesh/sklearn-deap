@@ -78,7 +78,7 @@ def _individual_to_params(individual, name_values):
 
 
 def _evalFunction(individual, name_values, X, y, scorer, cv, iid, fit_params,
-                  verbose=0, error_score='raise', score_cache={}):
+                  verbose=0, error_score='raise', score_cache={}, return_train_score=False):
     """ Developer Note:
         --------------------
         score_cache was purposefully moved to parameters, and given a dict reference.
@@ -90,31 +90,50 @@ def _evalFunction(individual, name_values, X, y, scorer, cv, iid, fit_params,
 
     parameters = _individual_to_params(individual, name_values)
     score = 0
+    train_score = 0
     n_test = 0
+    n_train = 0
 
     paramkey = str(individual)
     if paramkey in score_cache:
-        score = score_cache[paramkey]
+        res_score = score_cache[paramkey]
     else:
         for train, test in cv.split(X, y):
             assert len(train) > 0 and len(test) > 0, "Training and/or testing not long enough for evaluation."
-            _score = _fit_and_score(estimator=individual.est, X=X, y=y, scorer=scorer,
+            _score_tup = _fit_and_score(estimator=individual.est, X=X, y=y, scorer=scorer,
                                     train=train, test=test, verbose=verbose,
                                     parameters=parameters, fit_params=fit_params,
-                                    error_score=error_score)[0]
+                                    error_score=error_score, return_train_score=return_train_score)
+            if return_train_score:
+                _train_score = _score_tup[0]
+                _score = _score_tup[1]
+            else:
+                _score = _score_tup[0]
 
             if iid:
                 score += _score * len(test)
                 n_test += len(test)
+                if return_train_score:
+                    train_score += _train_score * len(train)
+                    n_train += len(train)
             else:
                 score += _score
                 n_test += 1
+                if return_train_score:
+                    train_score += _train_score
+                    n_train += 1
+
 
         assert n_test > 0, "No fitting was accomplished, check data and cross validation method."
         score /= float(n_test)
-        score_cache[paramkey] = score
+        res_score = (score, )
+        if return_train_score:
+            train_score /= float(n_train)
+            res_score = (score, train_score)
 
-    return (score,)
+        score_cache[paramkey] = res_score
+
+    return res_score
 
 
 class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
@@ -290,7 +309,7 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
                  gene_mutation_prob=0.1, gene_crossover_prob=0.5,
                  tournament_size=3, generations_number=10, gene_type=None,
                  n_jobs=1, iid=True, error_score='raise',
-                 fit_params={}):
+                 fit_params={}, return_train_score=False):
         super(EvolutionaryAlgorithmSearchCV, self).__init__(
             estimator=estimator, scoring=scoring, fit_params=fit_params,
             iid=iid, refit=refit, cv=cv, verbose=verbose,
@@ -308,8 +327,14 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
         self.best_score_ = None
         self.best_params_ = None
         self.score_cache = {}
+        self.return_train_score = return_train_score
         self.n_jobs = n_jobs
-        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+        
+        if return_train_score:
+            creator.create("FitnessMax", base.Fitness, weights=(1e10, 1e-10)) # weights cannot be zero, but we want only the first "test" score to matter
+        else:
+            creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+
         creator.create("Individual", list, est=clone(self.estimator), fitness=creator.FitnessMax)
 
     @property
@@ -328,22 +353,34 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
                 # Get individuals and indexes, their list of scores,
                 # and additionally the name_values for this set of parameters
 
-                idxs, individuals, each_scores = zip(*[(idx, indiv, np.mean(indiv.fitness.values))
+                idxs, individuals, each_scores = zip(*[(idx, indiv, indiv.fitness.values)
                                                 for idx, indiv in list(gen.genealogy_history.items())
                                                 if indiv.fitness.valid and not np.all(np.isnan(indiv.fitness.values))])
 
                 name_values, _, _ = _get_param_types_maxint(possible_params[p])
+
+                test_scores = [tup[0] for tup in each_scores]
+                if self.return_train_score:
+                    train_scores = [tup[1] for tup in each_scores]
 
                 # Add to output
                 out['param_index'] += [p] * len(idxs)
                 out['index'] += idxs
                 out['params'] += [_individual_to_params(indiv, name_values)
                                 for indiv in individuals]
-                out['mean_test_score'] += [np.nanmean(scores) for scores in each_scores]
-                out['std_test_score'] += [np.nanstd(scores) for scores in each_scores]
-                out['min_test_score'] += [np.nanmin(scores) for scores in each_scores]
-                out['max_test_score'] += [np.nanmax(scores) for scores in each_scores]
-                out['nan_test_score?'] += [np.any(np.isnan(scores)) for scores in each_scores]
+                out['mean_test_score'] += [np.nanmean(scores) for scores in test_scores]
+                out['std_test_score'] += [np.nanstd(scores) for scores in test_scores]
+                out['min_test_score'] += [np.nanmin(scores) for scores in test_scores]
+                out['max_test_score'] += [np.nanmax(scores) for scores in test_scores]
+                out['nan_test_score?'] += [np.any(np.isnan(scores)) for scores in test_scores]
+
+                if self.return_train_score:
+                    out['mean_train_score'] += [np.nanmean(scores) for scores in train_scores]
+                    out['std_train_score'] += [np.nanstd(scores) for scores in train_scores]
+                    out['min_train_score'] += [np.nanmin(scores) for scores in train_scores]
+                    out['max_train_score'] += [np.nanmax(scores) for scores in train_scores]
+                    out['nan_train_score?'] += [np.any(np.isnan(scores)) for scores in train_scores]
+
             self._cv_results = out
 
         return self._cv_results
@@ -358,6 +395,7 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
         self.best_estimator_ = None
         self.best_mem_score_ = float("-inf")
         self.best_mem_params_ = None
+        self.all_history_, self.all_logbooks_ = [], [] # we need to reset history if we fit again the same instance
         for possible_params in self.possible_params:
             _check_param_grid(possible_params)
             self._fit(X, y, possible_params)
@@ -422,7 +460,7 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
                          name_values=name_values, X=X, y=y,
                          scorer=self.scorer_, cv=cv, iid=self.iid, verbose=self.verbose,
                          error_score=self.error_score, fit_params=self.fit_params,
-                         score_cache=self.score_cache)
+                         score_cache=self.score_cache, return_train_score=self.return_train_score)
 
         toolbox.register("mate", _cxIndividual, indpb=self.gene_crossover_prob, gene_type=self.gene_type)
 
@@ -433,11 +471,18 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
         hof = tools.HallOfFame(1)
 
         # Stats
-        stats = tools.Statistics(lambda ind: ind.fitness.values)
-        stats.register("avg", np.nanmean)
-        stats.register("min", np.nanmin)
-        stats.register("max", np.nanmax)
-        stats.register("std", np.nanstd)
+        if self.return_train_score:
+            stats = tools.Statistics(lambda ind: ind.fitness.values)
+            stats.register("test avg", lambda x: np.nanmean(x, axis=0)[0])
+            stats.register("test max", lambda x: np.nanmean(x, axis=0)[0])
+            stats.register("train avg", lambda x: np.nanmean(x, axis=0)[1])
+            stats.register("train max", lambda x: np.nanmean(x, axis=0)[1])
+        else:
+            stats = tools.Statistics(lambda ind: (ind.fitness.values[0],))
+            stats.register("avg", np.nanmean)
+            stats.register("min", np.nanmin)
+            stats.register("max", np.nanmax)
+            stats.register("std", np.nanstd)
 
         # History
         hist = tools.History()
