@@ -35,7 +35,8 @@ def _get_param_types_maxint(params):
     name_values = list(params.items())
     types = []
     for _, possible_values in name_values:
-        if isinstance(possible_values[0], float):
+        # int params should also benefit from cross-over of values
+        if isinstance(possible_values[0], float) or isinstance(possible_values[0], int):
             types.append(param_types.Numerical)
         else:
             types.append(param_types.Categorical)
@@ -78,7 +79,7 @@ def _individual_to_params(individual, name_values):
 
 
 def _evalFunction(individual, name_values, X, y, scorer, cv, iid, fit_params,
-                  verbose=0, error_score='raise', score_cache={}, return_train_score=False):
+                  verbose=0, error_score='raise', score_cache={}, return_train_score=False, ratio_power=0):
     """ Developer Note:
         --------------------
         score_cache was purposefully moved to parameters, and given a dict reference.
@@ -130,6 +131,10 @@ def _evalFunction(individual, name_values, X, y, scorer, cv, iid, fit_params,
         if return_train_score:
             train_score /= float(n_train)
             res_score = (score, train_score)
+
+        ratio = score / train_score
+        goodness = score * np.power(ratio, ratio_power)
+        res_score = (goodness, train_score, score)
 
         score_cache[paramkey] = res_score
 
@@ -309,7 +314,7 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
                  gene_mutation_prob=0.1, gene_crossover_prob=0.5,
                  tournament_size=3, generations_number=10, gene_type=None,
                  n_jobs=1, iid=True, error_score='raise',
-                 fit_params={}, return_train_score=False):
+                 fit_params={}, return_train_score=False, ratio_power=0):
         super(EvolutionaryAlgorithmSearchCV, self).__init__(
             estimator=estimator, scoring=scoring, fit_params=fit_params,
             iid=iid, refit=refit, cv=cv, verbose=verbose,
@@ -328,10 +333,11 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
         self.best_params_ = None
         self.score_cache = {}
         self.return_train_score = return_train_score
+        self.ratio_power = ratio_power
         self.n_jobs = n_jobs
         
         if return_train_score:
-            creator.create("FitnessMax", base.Fitness, weights=(1e10, 1e-10)) # weights cannot be zero, but we want only the first "test" score to matter
+            creator.create("FitnessMax", base.Fitness, weights=(1, 1, 1))
         else:
             creator.create("FitnessMax", base.Fitness, weights=(1.0,))
 
@@ -359,7 +365,7 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
 
                 name_values, _, _ = _get_param_types_maxint(possible_params[p])
 
-                test_scores = [tup[0] for tup in each_scores]
+                test_scores = [tup[2] for tup in each_scores]
                 if self.return_train_score:
                     train_scores = [tup[1] for tup in each_scores]
 
@@ -406,6 +412,8 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
                 self.best_estimator_.fit(X, y, **self.fit_params)
             else:
                 self.best_estimator_.fit(X, y)
+
+        return self
 
     def _fit(self, X, y, parameter_dict):
         self._cv_results = None  # To indicate to the property the need to update
@@ -460,7 +468,7 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
                          name_values=name_values, X=X, y=y,
                          scorer=self.scorer_, cv=cv, iid=self.iid, verbose=self.verbose,
                          error_score=self.error_score, fit_params=self.fit_params,
-                         score_cache=self.score_cache, return_train_score=self.return_train_score)
+                         score_cache=self.score_cache, return_train_score=self.return_train_score, ratio_power=self.ratio_power)
 
         toolbox.register("mate", _cxIndividual, indpb=self.gene_crossover_prob, gene_type=self.gene_type)
 
@@ -473,10 +481,12 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
         # Stats
         if self.return_train_score:
             stats = tools.Statistics(lambda ind: ind.fitness.values)
-            stats.register("test avg", lambda x: np.nanmean(x, axis=0)[0])
-            stats.register("test max", lambda x: np.nanmean(x, axis=0)[0])
+            stats.register("test avg", lambda x: np.nanmean(x, axis=0)[2])
+            stats.register("test max", lambda x: np.nanmax(x, axis=0)[2])
             stats.register("train avg", lambda x: np.nanmean(x, axis=0)[1])
-            stats.register("train max", lambda x: np.nanmean(x, axis=0)[1])
+            stats.register("train max", lambda x: np.nanmax(x, axis=0)[1])
+            stats.register("fitness avg", lambda x: np.nanmean(x, axis=0)[0])
+            stats.register("fitness max", lambda x: np.nanmax(x, axis=0)[0])
         else:
             stats = tools.Statistics(lambda ind: (ind.fitness.values[0],))
             stats.register("avg", np.nanmean)
@@ -504,7 +514,7 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
         current_best_params_ = _individual_to_params(hof[0], name_values)
         if self.verbose:
             print("Best individual is: %s\nwith fitness: %s" % (
-                current_best_params_, current_best_score_))
+                current_best_params_, hof[0].fitness.values))
 
         if current_best_score_ > self.best_mem_score_:
             self.best_mem_score_ = current_best_score_
